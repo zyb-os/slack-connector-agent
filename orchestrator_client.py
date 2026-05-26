@@ -35,6 +35,28 @@ HEARTBEAT_INTERVAL = 15  # seconds
 
 _ID_FILE = Path(".agent_id")
 
+# ---------------------------------------------------------------------------
+# Readiness: settings that MUST have a non-empty value before this agent can
+# accept traffic.  key → (human label, setup instruction)
+# ---------------------------------------------------------------------------
+_REQUIRED_SETTINGS: dict[str, tuple[str, str]] = {
+    "slack_bot_token": (
+        "Slack Bot Token",
+        "Create a Slack app at https://api.slack.com/apps, enable Bot Token Scopes, "
+        "install the app to your workspace, and copy the Bot Token (xoxb-…).",
+    ),
+    "slack_app_token": (
+        "Slack App-Level Token",
+        "Under your Slack app → Settings → Basic Information → App-Level Tokens, "
+        "generate a token with the 'connections:write' scope (xapp-…).",
+    ),
+    "slack_signing_secret": (
+        "Slack Signing Secret",
+        "Under your Slack app → Settings → Basic Information → App Credentials, "
+        "copy the Signing Secret.",
+    ),
+}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -72,6 +94,9 @@ class OrchestratorClient:
 
         # Settings received at registration or via settings_push
         self.common_settings: dict = {}
+
+        # Readiness: populated after registration; empty = ready to serve
+        self._missing_required: list[str] = list(_REQUIRED_SETTINGS.keys())
 
         # Metrics
         self._active_tasks = 0
@@ -199,6 +224,7 @@ class OrchestratorClient:
             **data.get("common_settings", {}),
             **data.get("agent_settings", {}),
         }
+        self._check_readiness()
         logger.info("Registered as %s  ws_url=%s", self.agent_id, self.ws_url)
         if self.common_settings:
             logger.info("Received %d setting(s) from orchestrator at registration", len(self.common_settings))
@@ -390,15 +416,69 @@ class OrchestratorClient:
             "correlation_id": correlation_id,
         }
 
+    # ------------------------------------------------------------------
+    # Readiness helpers
+    # ------------------------------------------------------------------
+
+    def _check_readiness(self) -> None:
+        """Recompute missing required settings from current common_settings."""
+        missing = [
+            key for key in _REQUIRED_SETTINGS
+            if not self.common_settings.get(key)
+        ]
+        was_unready = bool(self._missing_required)
+        self._missing_required = missing
+        if missing:
+            labels = [_REQUIRED_SETTINGS[k][0] for k in missing]
+            logger.warning(
+                "Agent NOT READY — missing required settings: %s. "
+                "Set them via the orchestrator dashboard or .env file.",
+                ", ".join(labels),
+            )
+        elif was_unready:
+            logger.info("All required settings are now configured — agent is READY")
+
+    def _not_ready_payload(self) -> dict:
+        """Build the structured error payload returned to callers when not ready."""
+        details = []
+        for key in self._missing_required:
+            label, instruction = _REQUIRED_SETTINGS[key]
+            details.append({"setting": key, "label": label, "how_to_set": instruction})
+        return {
+            "error_code": "AGENT_NOT_READY",
+            "message": (
+                f"Agent '{AGENT_NAME}' is not ready to accept traffic. "
+                f"The following required settings are not configured: "
+                f"{', '.join(_REQUIRED_SETTINGS[k][0] for k in self._missing_required)}."
+            ),
+            "missing_settings": details,
+            "resolution": (
+                "Configure the missing settings via the orchestrator dashboard "
+                f"(Settings panel for agent '{AGENT_NAME}') or set them in the "
+                "agent's .env file and restart the agent."
+            ),
+        }
+
+    # ------------------------------------------------------------------
+
     async def _heartbeat_loop(self) -> None:
         while True:
             uptime = time.monotonic() - self._start_time
+            _status = (
+                "error" if self._missing_required
+                else ("busy" if self._active_tasks > 0 else "available")
+            )
             hb = self._make_envelope(
                 "heartbeat",
                 {
-                    "status": "busy" if self._active_tasks > 0 else "available",
+                    "status": _status,
                     "current_load": min(self._active_tasks / 10.0, 1.0),
                     "active_tasks": self._active_tasks,
+                    "error_message": (
+                        f"Missing required settings: "
+                        f"{', '.join(_REQUIRED_SETTINGS[k][0] for k in self._missing_required)}"
+                        if self._missing_required else None
+                    ),
                     "metrics": {
                         "tasks_completed": self._tasks_completed,
                         "tasks_failed": self._tasks_failed,
@@ -407,7 +487,7 @@ class OrchestratorClient:
                 },
             )
             await self._ws.send(json.dumps(hb))
-            logger.debug("Heartbeat sent (load=%.2f)", hb["payload"]["current_load"])
+            logger.debug("Heartbeat sent (status=%s)", _status)
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     async def _recv_loop(self) -> None:
@@ -460,6 +540,7 @@ class OrchestratorClient:
                 if pushed:
                     self.common_settings.update(pushed)
                     logger.info("Settings push received: %s", list(pushed.keys()))
+                    self._check_readiness()
                     for handler in self._settings_handlers:
                         asyncio.create_task(handler(self.common_settings.copy()))
 
@@ -495,6 +576,28 @@ class OrchestratorClient:
 
     async def _dispatch_task(self, msg: dict) -> None:
         """Call registered task handlers and send a task_response."""
+        # Refuse traffic immediately if required settings are not configured.
+        if self._missing_required:
+            not_ready = self._make_envelope(
+                "task_response",
+                {
+                    "success": False,
+                    "error": f"AGENT_NOT_READY: {AGENT_NAME} cannot accept traffic until "
+                             f"required settings are configured. "
+                             f"Missing: {', '.join(_REQUIRED_SETTINGS[k][0] for k in self._missing_required)}.",
+                    "output_data": self._not_ready_payload(),
+                    "duration_ms": 0,
+                },
+                recipient_id=msg.get("sender_id"),
+                correlation_id=msg.get("id"),
+            )
+            await self._ws.send(json.dumps(not_ready))
+            logger.warning(
+                "Rejected task (capability=%s) — agent not ready",
+                msg.get("payload", {}).get("capability"),
+            )
+            return
+
         self._active_tasks += 1
         start = time.monotonic()
         capability = msg.get("payload", {}).get("capability")
